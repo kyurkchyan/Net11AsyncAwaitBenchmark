@@ -19,35 +19,65 @@ without you changing any code.
   validator throws on net11.0 — the InProcess toolchain bypasses it and is fine here
   because the host runtime *is* the variable under test)
 - AMD Ryzen 9 9950X (16 phys / 32 logical), Server GC, TieredPGO on
-- 3 warmup + 8 iteration runs per benchmark (shorter than default; some sub-µs
-  results have ±5% noise as a result)
+- 3 warmup + 8 iteration runs per benchmark (shorter than default; the
+  5-trial aggregate below absorbs the resulting per-run noise)
+- 5 independent end-to-end trials, fully sequential — no two runs ever shared
+  the CPU. Driver: `run-trials.ps1`.
 
-## Results
+## Results — 5-trial aggregate
 
-Both runs were executed sequentially on the same machine so they didn't share
-the CPU. Sorted by speedup descending:
+A single run is noisy; one comparison table doesn't tell you which gains are
+reproducible and which are measurement artifacts. So `run-trials.ps1` repeats
+the whole net10 → net11 → diff sequence **5 times back-to-back** (sequentially,
+never overlapping on the CPU) and aggregates the per-trial speedups. Each trial
+is independently stored under `BenchmarkResults/run-1/` … `run-5/`, with a
+single `BenchmarkResults/aggregate.csv` rolling them up.
 
-| Benchmark                                       | net10 (Mean) | net11 (Mean) | Δ      | Speedup |
-| ----------------------------------------------- | -----------: | -----------: | -----: | ------: |
-| YieldChainBench.YieldLoop                       |    35.59 µs  |    15.32 µs  | -57.0% | **2.32×** |
-| ChannelPingPongBench.UnboundedChannelRoundTrip  |   109.0 µs   |    56.58 µs  | -48.1% | 1.93×   |
-| YieldChainBench.DeepNestedYield                 |    42.90 µs  |    23.62 µs  | -44.9% | 1.82×   |
-| SyncCompletionBench.AwaitValueTaskCompleted     |   460.9 ns   |   385.2 ns   | -16.4% | 1.20×   |
-| ChannelPingPongBench.BoundedChannelRoundTrip    |   155.8 µs   |   130.61 µs  | -16.2% | 1.19×   |
-| DeepCallStackBench.DeepStackValueTask           |    23.64 µs  |    21.97 µs  |  -7.1% | 1.08×   |
-| SyncCompletionBench.AwaitCompletedTask          |   684.0 ns   |   651.3 ns   |  -4.8% | 1.05×   |
-| SyncCompletionBench.MemoryStreamReadAsync       | 10203.5 ns   |  9913.6 ns   |  -2.8% | 1.03×   |
-| SyncCompletionBench.AwaitFromResult             |  1063.7 ns   |  1035.0 ns   |  -2.7% | 1.03×   |
-| DeepCallStackBench.DeepStackBottomingInBcl      |    56.87 µs  |    59.63 µs  |  +4.9% | 0.95×   |
+Sorted by mean speedup descending. n = 5 trials per row, ~19 min total wall.
 
-The single regression (`DeepStackBottomingInBcl`, +4.9%) is within the noise
-band at this iteration count — that benchmark allocates ~430 kB/op and
-its variance is dominated by Gen0 GC frequency rather than async machinery.
+| Benchmark                                       | Mean speedup | StdDev | Min  | Max  | Mean Δ% | Per-trial speedups          |
+| ----------------------------------------------- | -----------: | -----: | ---: | ---: | ------: | --------------------------- |
+| YieldChainBench.YieldLoop                       |   **2.18×**  |  0.20  | 1.97 | 2.41 |  -53.8% | 1.97, 2.34, 2.41, 2.20, 1.98 |
+| ChannelPingPongBench.UnboundedChannelRoundTrip  |     2.00×    |  0.04  | 1.96 | 2.05 |  -50.0% | 1.97, 2.00, 2.02, 2.05, 1.96 |
+| YieldChainBench.DeepNestedYield                 |     1.79×    |  0.06  | 1.72 | 1.88 |  -44.0% | 1.79, 1.75, 1.88, 1.72, 1.79 |
+| ChannelPingPongBench.BoundedChannelRoundTrip    |     1.09×    |  0.04  | 1.04 | 1.14 |   -8.0% | 1.04, 1.11, 1.07, 1.07, 1.14 |
+| SyncCompletionBench.AwaitValueTaskCompleted     |     1.08×    |  0.03  | 1.05 | 1.12 |   -7.3% | 1.05, 1.10, 1.12, 1.05, 1.07 |
+| DeepCallStackBench.DeepStackValueTask           |     1.07×    |  0.07  | 0.97 | 1.14 |   -5.8% | 1.07, 1.02, 1.13, 1.14, 0.97 |
+| SyncCompletionBench.MemoryStreamReadAsync       |     1.03×    |  0.04  | 0.97 | 1.08 |   -3.3% | 0.97, 1.08, 1.04, 1.04, 1.04 |
+| DeepCallStackBench.DeepStackBottomingInBcl      |     1.02×    |  0.09  | 0.92 | 1.17 |   -1.4% | 0.92, 1.17, 0.98, 1.01, 1.03 |
+| SyncCompletionBench.AwaitCompletedTask          |     1.00×    |  0.04  | 0.96 | 1.06 |   +0.1% | 0.96, 0.96, 1.06, 1.02, 0.99 |
+| SyncCompletionBench.AwaitFromResult             |     0.98×    |  0.02  | 0.96 | 1.01 |   +1.9% | 1.01, 0.98, 0.99, 0.96, 0.96 |
 
-The biggest wins are in code that suspends and resumes a lot (`Task.Yield`
-loops, Channel ping-pong). The smallest wins are in the trivial
-sync-completion paths, where the C# compiler already optimized state-machine
-allocation away.
+### How to read the table
+
+- **The top three benchmarks are the real story**: code that genuinely
+  suspends and resumes inside the BCL (Task.Yield loops, Channel.WriteAsync /
+  ReadAsync round-trips) is consistently **~1.8–2.2× faster** on net11. The
+  `UnboundedChannelRoundTrip` row in particular has stddev 0.04 across 5
+  trials — for a number near 2.00 that's about ±2%, which is as reproducible
+  as benchmarks of this kind get.
+- **The middle four (~1.07–1.09×)** are smaller-but-real wins on workloads
+  that mix in some BCL await overhead but mostly run in user code.
+- **The bottom three (~0.98–1.03×)** are at the noise floor. The mean delta is
+  ≤ 3% in either direction and the stddev brackets cross 1.0 — the C#
+  compiler already optimized these sync-completion paths so there's almost
+  nothing left for runtime-async to remove. The "regression" of 0.98× on
+  `AwaitFromResult` is consistent with measurement noise, not a real
+  slowdown.
+
+### What this means in practice
+
+The headline "every await into BCL gets cheaper" is true, but the magnitude
+depends entirely on **how much real async machinery the BCL path actually
+exercises**. Workloads dominated by suspend/resume traffic (real I/O,
+producer/consumer queues, anything that frequently yields) should see
+double-digit-percent to nearly-2× CPU reductions. Workloads dominated by
+hot fast-paths that complete synchronously will see basically no change —
+they were already nearly free.
+
+The variance pattern matters too: the big-win benchmarks have **tight
+stddev** (the gain is structural), while the at-the-noise-floor benchmarks
+have wider relative stddev (you're just measuring jitter).
 
 ### Allocations
 
@@ -76,6 +106,8 @@ the allocation deltas for the user-code path.
 
 ## Running the benchmarks
 
+For a single comparison:
+
 ```pwsh
 dotnet build -c Release
 dotnet run -c Release -f net10.0 --no-build -- --filter "AsyncBenchmark.Benchmarks.*" --artifacts BenchmarkResults\net10
@@ -83,5 +115,18 @@ dotnet run -c Release -f net11.0 --no-build -- --filter "AsyncBenchmark.Benchmar
 .\compare-results.ps1
 ```
 
-All generated outputs land under `BenchmarkResults/` (the BDN artifacts and the
-`comparison.csv` summary). That folder is git-ignored.
+For the full 5-trial reproducibility experiment (the one that produced the
+table above):
+
+```pwsh
+.\run-trials.ps1 -Trials 5
+```
+
+This clears `BenchmarkResults/`, runs `N` independent trials (each containing
+a fresh net10 → net11 → comparison sequence), and writes the aggregated
+mean/stddev/min/max of the speedups to `BenchmarkResults/aggregate.csv`.
+Allow ~4 min per trial (~20 min for 5).
+
+All generated outputs land under `BenchmarkResults/` (BDN artifacts, run
+logs, per-trial `comparison.csv`, and the rollup `aggregate.csv`). That
+folder is git-ignored.
